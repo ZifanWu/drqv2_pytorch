@@ -2,6 +2,7 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+import socket
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -21,6 +22,8 @@ import utils
 from logger import Logger
 from replay_buffer import ReplayBufferStorage, make_replay_loader
 from video import TrainVideoRecorder, VideoRecorder
+
+import wandb
 
 torch.backends.cudnn.benchmark = True
 
@@ -113,13 +116,15 @@ class Workspace:
                 step += 1
 
             episode += 1
-            self.video_recorder.save(f'{self.global_frame}.mp4')
+            # self.video_recorder.save(f'{self.global_frame}.mp4')
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
             log('episode_reward', total_reward / episode)
             log('episode_length', step * self.cfg.action_repeat / episode)
             log('episode', self.global_episode)
             log('step', self.global_step)
+        if self.cfg.use_wandb:
+            wandb.log({'eval_ret': total_reward / episode, 'env_step': self.global_step})
 
     def train(self):
         # predicates
@@ -213,6 +218,24 @@ def main(cfg):
     if snapshot.exists():
         print(f'resuming: {snapshot}')
         workspace.load_snapshot()
+    # -------------------------------------------------
+    run_dir = "./results"
+    if not Path(run_dir).exists():
+        os.makedirs(str(run_dir))
+    rnd_num = np.random.randint(0, 100000, size=1)[0]
+    if cfg.use_wandb:
+        wandb.init(config=dict(cfg),
+                    project='dormant-neuron',
+                    entity='zarzard',
+                    notes=socket.gethostname(),
+                    name= str(rnd_num),
+                    dir=str(run_dir),
+                    job_type="training",
+                    reinit=True,
+                    # sync_tensorboard=True,
+                    monitor_gym=True,
+                    save_code=True)
+    # -------------------------------------------------
     workspace.train()
 
 

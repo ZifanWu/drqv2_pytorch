@@ -1,0 +1,2 @@
+- task=quadruped_walk
+- use_wandb=true

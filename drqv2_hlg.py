@@ -13,20 +13,21 @@ import utils
 
 
 class HLGaussLoss(nn.Module): 
-    def __init__(self, min_value: float, max_value: float, n_logits: int, sigma: float):
+    def __init__(self, min_value: float, max_value: float, n_logits: int, sigma: float, device):
         super().__init__()
         self.min_value = min_value
         self.max_value = max_value
         self.n_logits = n_logits
         self.sigma = sigma
-        self.support = torch.linspace( min_value, max_value, n_logits + 1, dtype=torch.float32)
+        self.support = torch.linspace(min_value, max_value, n_logits + 1, dtype=torch.float32, device=device)
+        self.device = device
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return F.cross_entropy(logits, self.transform_to_probs(target))
 
     def transform_to_probs(self, target: torch.Tensor) -> torch.Tensor:
         target = torch.clip(target, self.min_value, self.max_value)
-        cdf_evals = torch.special.erf( (self.support - target.unsqueeze(-1)) / (torch.sqrt(torch.tensor(2.0)) * self.sigma) )
+        cdf_evals = torch.special.erf((self.support - target.unsqueeze(-1)) / (torch.sqrt(torch.tensor(2.0)) * self.sigma))
         z = cdf_evals[..., -1] - cdf_evals[..., 0]
         bin_probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]
         return bin_probs / z.unsqueeze(-1)
@@ -119,7 +120,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
+    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim, n_logits):
         super().__init__()
 
         self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
@@ -128,30 +129,31 @@ class Critic(nn.Module):
         self.Q1 = nn.Sequential(
             nn.Linear(feature_dim + action_shape[0], hidden_dim),
             nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, 1))
+            nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
 
         self.Q2 = nn.Sequential(
             nn.Linear(feature_dim + action_shape[0], hidden_dim),
             nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, 1))
+            nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
 
         self.apply(utils.weight_init)
 
     def forward(self, obs, action):
         h = self.trunk(obs)
         h_action = torch.cat([h, action], dim=-1)
-        q1 = self.Q1(h_action)
-        q2 = self.Q2(h_action)
+        q1_logits = self.Q1(h_action)
+        q2_logits = self.Q2(h_action)
 
-        return q1, q2
+        return q1_logits, q2_logits
 
 
 class DrQV2Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_schedule, stddev_clip, use_tb,
-                 min_value, max_value, n_logits, sigma):
+                 min_value, max_value, n_logits, sigma, use_wandb):
         self.device = device
+        self.use_wandb = use_wandb
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
         self.use_tb = use_tb
@@ -165,9 +167,9 @@ class DrQV2Agent:
                            hidden_dim).to(device)
 
         self.critic = Critic(self.encoder.repr_dim, action_shape, feature_dim,
-                             hidden_dim).to(device)
+                             hidden_dim, n_logits).to(device)
         self.critic_target = Critic(self.encoder.repr_dim, action_shape,
-                                    feature_dim, hidden_dim).to(device)
+                                    feature_dim, hidden_dim, n_logits).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         # optimizers
@@ -182,7 +184,7 @@ class DrQV2Agent:
         self.critic_target.train()
 
         # HLGauss
-        self.HLG = HLGaussLoss(min_value, max_value, n_logits, sigma)
+        self.HLG = HLGaussLoss(min_value, max_value, n_logits, sigma, device)
 
     def train(self, training=True):
         self.training = training
@@ -210,18 +212,19 @@ class DrQV2Agent:
             stddev = utils.schedule(self.stddev_schedule, step)
             dist = self.actor(next_obs, stddev)
             next_action = dist.sample(clip=self.stddev_clip)
-            target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
+            target_Q1_logits, target_Q2_logits = self.critic_target(next_obs, next_action)
+            target_Q1, target_Q2 = self.HLG.transform_from_probs(F.softmax(target_Q1_logits)),\
+                                   self.HLG.transform_from_probs(F.softmax(target_Q2_logits))
             target_V = torch.min(target_Q1, target_Q2)
-            target_Q = reward + (discount * target_V)
+            target_Q = reward + (discount * target_V.unsqueeze(-1))
 
-        Q1, Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        Q1_logits, Q2_logits = self.critic(obs, action)
+        critic_loss = self.HLG.forward(Q1_logits, target_Q.squeeze()) + self.HLG.forward(Q2_logits, target_Q.squeeze())
 
-        if self.use_tb:
-            metrics['critic_target_q'] = target_Q.mean().item()
-            metrics['critic_q1'] = Q1.mean().item()
-            metrics['critic_q2'] = Q2.mean().item()
-            metrics['critic_loss'] = critic_loss.item()
+        if self.use_wandb:
+            wandb.log({'q1': Q1.mean().item(), 'grad_step': step})
+            wandb.log({'q2': Q2.mean().item(), 'grad_step': step})
+            wandb.log({'critic_loss': critic_loss.item(), 'grad_step': step})
 
         # optimize encoder and critic
         self.encoder_opt.zero_grad(set_to_none=True)
@@ -239,7 +242,9 @@ class DrQV2Agent:
         dist = self.actor(obs, stddev)
         action = dist.sample(clip=self.stddev_clip)
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        Q1, Q2 = self.critic(obs, action)
+        Q1_logits, Q2_logits = self.critic(obs, action)
+        Q1, Q2 = self.HLG.transform_from_probs(F.softmax(Q1_logits)),\
+                 self.HLG.transform_from_probs(F.softmax(Q2_logits))
         Q = torch.min(Q1, Q2)
 
         actor_loss = -Q.mean()
@@ -249,10 +254,8 @@ class DrQV2Agent:
         actor_loss.backward()
         self.actor_opt.step()
 
-        if self.use_tb:
-            metrics['actor_loss'] = actor_loss.item()
-            metrics['actor_logprob'] = log_prob.mean().item()
-            metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
+        if self.use_wandb:
+            wandb.log({'actor_loss': actor_loss.item(), 'grad_step': step})
 
         return metrics
 
