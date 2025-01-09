@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torch.special
 
 import utils
+import wandb
 
 
 class HLGaussLoss(nn.Module): 
@@ -213,8 +214,8 @@ class DrQV2Agent:
             dist = self.actor(next_obs, stddev)
             next_action = dist.sample(clip=self.stddev_clip)
             target_Q1_logits, target_Q2_logits = self.critic_target(next_obs, next_action)
-            target_Q1, target_Q2 = self.HLG.transform_from_probs(F.softmax(target_Q1_logits)),\
-                                   self.HLG.transform_from_probs(F.softmax(target_Q2_logits))
+            target_Q1, target_Q2 = self.HLG.transform_from_probs(F.softmax(target_Q1_logits, dim=-1)),\
+                                   self.HLG.transform_from_probs(F.softmax(target_Q2_logits, dim=-1))
             target_V = torch.min(target_Q1, target_Q2)
             target_Q = reward + (discount * target_V.unsqueeze(-1))
 
@@ -222,8 +223,8 @@ class DrQV2Agent:
         critic_loss = self.HLG.forward(Q1_logits, target_Q.squeeze()) + self.HLG.forward(Q2_logits, target_Q.squeeze())
 
         if self.use_wandb:
-            wandb.log({'q1': Q1.mean().item(), 'grad_step': step})
-            wandb.log({'q2': Q2.mean().item(), 'grad_step': step})
+            # wandb.log({'q1': Q1.mean().item(), 'grad_step': step})
+            # wandb.log({'q2': Q2.mean().item(), 'grad_step': step})
             wandb.log({'critic_loss': critic_loss.item(), 'grad_step': step})
 
         # optimize encoder and critic
@@ -243,8 +244,8 @@ class DrQV2Agent:
         action = dist.sample(clip=self.stddev_clip)
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         Q1_logits, Q2_logits = self.critic(obs, action)
-        Q1, Q2 = self.HLG.transform_from_probs(F.softmax(Q1_logits)),\
-                 self.HLG.transform_from_probs(F.softmax(Q2_logits))
+        Q1, Q2 = self.HLG.transform_from_probs(F.softmax(Q1_logits, dim=-1)),\
+                 self.HLG.transform_from_probs(F.softmax(Q2_logits, dim=-1))
         Q = torch.min(Q1, Q2)
 
         actor_loss = -Q.mean()

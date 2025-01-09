@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import socket
+import time
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -40,7 +41,10 @@ class Workspace:
         print(f'workspace: {self.work_dir}')
 
         self.cfg = cfg
-        utils.set_seed_everywhere(cfg.seed)
+        
+        rng = np.random.default_rng()
+        self.seed = rng.integers(0, 100000)
+        utils.set_seed_everywhere(self.seed)
         self.device = torch.device(cfg.device)
         self.setup()
 
@@ -211,31 +215,43 @@ class Workspace:
 
 @hydra.main(config_path='cfgs', config_name='config')
 def main(cfg):
+    # -------------------------------------------------
+    if cfg.index > -1: # using sbatch
+        settings = []
+        for i in ['quadruped_run', 'acrobot_swingup', 'hopper_hop', 'walker_run', 'quadruped_walk']:
+            for j in [(100, 0.75)]:
+                settings.append([i, j])
+        setting_for_this_idx = settings[int(cfg.index)]
+        # cfg.task_name, cfg.agent._target_ = setting_for_this_idx
+        cfg.task_name, (cfg.agent.n_logits, cfg.agent.sigma) = setting_for_this_idx
+        cfg.agent._target_ = 'drqv2.DrQV2Agent'
+
+    run_dir = "/scratch/general/nfs1/$USER/"
+    if not Path(run_dir).exists():
+        os.makedirs(str(run_dir))
+    # -------------------------------------------------
     from train import Workspace as W
-    root_dir = Path.cwd()
     workspace = W(cfg)
+    root_dir = Path.cwd()
     snapshot = root_dir / 'snapshot.pt'
     if snapshot.exists():
         print(f'resuming: {snapshot}')
         workspace.load_snapshot()
-    # -------------------------------------------------
-    run_dir = "./results"
-    if not Path(run_dir).exists():
-        os.makedirs(str(run_dir))
-    rnd_num = np.random.randint(0, 100000, size=1)[0]
+
+    cfg_dict = dict(cfg).copy()
+    for k, v in cfg.agent.items():
+        cfg_dict[k] = v
     if cfg.use_wandb:
-        wandb.init(config=dict(cfg),
+        wandb.init(config=cfg_dict,
                     project='dormant-neuron',
                     entity='zarzard',
                     notes=socket.gethostname(),
-                    name= str(rnd_num),
+                    name=str(workspace.seed),
                     dir=str(run_dir),
                     job_type="training",
                     reinit=True,
-                    # sync_tensorboard=True,
                     monitor_gym=True,
                     save_code=True)
-    # -------------------------------------------------
     workspace.train()
 
 

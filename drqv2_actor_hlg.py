@@ -7,9 +7,35 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
+import torch.special
 
 import utils
+import wandb
+
+
+class HLGaussLoss(nn.Module): 
+    def __init__(self, min_value: float, max_value: float, n_logits: int, sigma: float, device):
+        super().__init__()
+        self.min_value = min_value
+        self.max_value = max_value
+        self.n_logits = n_logits
+        self.sigma = sigma
+        self.support = torch.linspace(min_value, max_value, n_logits + 1, dtype=torch.float32, device=device)
+        self.device = device
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(logits, self.transform_to_probs(target))
+
+    def transform_to_probs(self, target: torch.Tensor) -> torch.Tensor:
+        target = torch.clip(target, self.min_value, self.max_value)
+        cdf_evals = torch.special.erf((self.support - target.unsqueeze(-1)) / (torch.sqrt(torch.tensor(2.0)) * self.sigma))
+        z = cdf_evals[..., -1] - cdf_evals[..., 0]
+        bin_probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]
+        return bin_probs / z.unsqueeze(-1)
+
+    def transform_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        centers = (self.support[:-1] + self.support[1:]) / 2
+        return torch.sum(probs * centers, dim=-1)
 
 
 class RandomShiftsAug(nn.Module):
@@ -69,7 +95,7 @@ class Encoder(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
+    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim, n_logits):
         super().__init__()
 
         self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
@@ -79,19 +105,15 @@ class Actor(nn.Module):
                                     nn.ReLU(inplace=True),
                                     nn.Linear(hidden_dim, hidden_dim),
                                     nn.ReLU(inplace=True),
-                                    nn.Linear(hidden_dim, action_shape[0]))
+                                    nn.Linear(hidden_dim, action_shape[0] * n_logits))
 
         self.apply(utils.weight_init)
+        self.n_logits = n_logits
 
-    def forward(self, obs, std):
+    def forward(self, obs):
         h = self.trunk(obs)
-
-        mu = self.policy(h)
-        mu = torch.tanh(mu)
-        std = torch.ones_like(mu) * std
-
-        dist = utils.TruncatedNormal(mu, std)
-        return dist
+        h = self.policy(h)
+        return h.reshape(h.shape[0], -1, self.n_logits) # (B, a_dim, n_logits)
 
 
 class Critic(nn.Module):
@@ -128,18 +150,18 @@ class DrQV2Agent:
                  update_every_steps, stddev_schedule, stddev_clip, use_tb,
                  min_value, max_value, n_logits, sigma, use_wandb):
         self.device = device
+        self.use_wandb = use_wandb
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
         self.use_tb = use_tb
         self.num_expl_steps = num_expl_steps
         self.stddev_schedule = stddev_schedule
         self.stddev_clip = stddev_clip
-        self.use_wandb = use_wandb
 
         # models
         self.encoder = Encoder(obs_shape).to(device)
         self.actor = Actor(self.encoder.repr_dim, action_shape, feature_dim,
-                           hidden_dim).to(device)
+                           hidden_dim, n_logits).to(device)
 
         self.critic = Critic(self.encoder.repr_dim, action_shape, feature_dim,
                              hidden_dim).to(device)
@@ -158,6 +180,10 @@ class DrQV2Agent:
         self.train()
         self.critic_target.train()
 
+        # HLGauss
+        self.HLG = HLGaussLoss(-1, 1, n_logits, sigma, device)
+        self.n_logits = n_logits
+
     def train(self, training=True):
         self.training = training
         self.encoder.train(training)
@@ -167,23 +193,20 @@ class DrQV2Agent:
     def act(self, obs, step, eval_mode):
         obs = torch.as_tensor(obs, device=self.device)
         obs = self.encoder(obs.unsqueeze(0))
-        stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, stddev)
-        if eval_mode:
-            action = dist.mean
-        else:
-            action = dist.sample(clip=None)
-            if step < self.num_expl_steps:
-                action.uniform_(-1.0, 1.0)
+        logits = self.actor(obs)
+        B, a_dim, n_logits = logits.shape
+        logits = logits.reshape(-1, n_logits) # (1 * a_dim, n_logits)
+        action = self.HLG.transform_from_probs(F.softmax(logits, dim=-1)).reshape(B, a_dim)
         return action.cpu().numpy()[0]
 
     def update_critic(self, obs, action, reward, discount, next_obs, step):
         metrics = dict()
 
         with torch.no_grad():
-            stddev = utils.schedule(self.stddev_schedule, step)
-            dist = self.actor(next_obs, stddev)
-            next_action = dist.sample(clip=self.stddev_clip)
+            logits = self.actor(next_obs)
+            B, a_dim, n_logits = logits.shape
+            logits = logits.reshape(-1, n_logits) # (B * a_dim, n_logits)
+            next_action = self.HLG.transform_from_probs(F.softmax(logits, dim=-1)).reshape(B, a_dim)
             target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
             target_V = torch.min(target_Q1, target_Q2)
             target_Q = reward + (discount * target_V)
@@ -205,31 +228,32 @@ class DrQV2Agent:
 
         return metrics
 
-    def update_actor(self, obs, step):
+    def update_actor(self, obs, trgt_action, step):
         metrics = dict()
 
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, stddev)
-        action = dist.sample(clip=self.stddev_clip)
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        Q1, Q2 = self.critic(obs, action)
-        Q = torch.min(Q1, Q2)
-
-        actor_loss = -Q.mean()
+        logits = self.actor(obs)
+        B, a_dim, n_logits = logits.shape
+        # logits = logits.reshape(-1, n_logits) # (B * a_dim, n_logits)
+        # action = self.HLG.transform_from_probs(F.softmax(logits, dim=-1)).reshape(B, a_dim)
+        Q1, Q2 = self.critic(obs, trgt_action)
+        Q = torch.min(Q1, Q2) # (B, 1)
+        # actor_loss = (((action - trgt_action)**2).sum(-1, keepdim=True) * Q.detach()).mean()
+        # print(self.HLG.transform_to_probs(trgt_action).shape, trgt_action.shape) # (B, a_dim, n_logits) (B, a_dim)
+        # HLG = HLGaussLoss(-1, 1, self.n_logits, stddev, self.device)
+        trgt_logits = self.HLG.transform_to_probs(trgt_action)
+        actor_loss = torch.sum(F.cross_entropy(logits.reshape(-1, n_logits), trgt_logits.reshape(-1, n_logits)) * Q.squeeze().detach())
 
         # optimize actor
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_opt.step()
 
-        # if self.use_tb:
-        #     metrics['actor_loss'] = actor_loss.item()
-        #     metrics['actor_logprob'] = log_prob.mean().item()
-        #     metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
         if self.use_wandb:
             wandb.log({'actor_loss': actor_loss.item(), 'grad_step': step})
 
         return metrics
+
 
     def update(self, replay_iter, step):
         metrics = dict()
@@ -257,7 +281,7 @@ class DrQV2Agent:
             self.update_critic(obs, action, reward, discount, next_obs, step))
 
         # update actor
-        metrics.update(self.update_actor(obs.detach(), step))
+        metrics.update(self.update_actor(obs.detach(), action, step))
 
         # update critic target
         utils.soft_update_params(self.critic, self.critic_target,
