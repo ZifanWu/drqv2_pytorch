@@ -121,21 +121,34 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim, n_logits):
+    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim, n_logits, use_LN=False):
         super().__init__()
 
         self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
                                    nn.LayerNorm(feature_dim), nn.Tanh())
 
-        self.Q1 = nn.Sequential(
-            nn.Linear(feature_dim + action_shape[0], hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
-
-        self.Q2 = nn.Sequential(
-            nn.Linear(feature_dim + action_shape[0], hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
+        if use_LN:
+            self.Q1 = nn.Sequential(
+                nn.Linear(feature_dim + action_shape[0], hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
+            self.Q2 = nn.Sequential(
+                nn.Linear(feature_dim + action_shape[0], hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
+        else:
+            self.Q1 = nn.Sequential(
+                nn.Linear(feature_dim + action_shape[0], hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
+            self.Q2 = nn.Sequential(
+                nn.Linear(feature_dim + action_shape[0], hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True), nn.Linear(hidden_dim, n_logits))
 
         self.apply(utils.weight_init)
 
@@ -152,7 +165,8 @@ class DrQV2Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_schedule, stddev_clip, use_tb,
-                 min_value, max_value, n_logits, sigma, use_wandb):
+                 min_value, max_value, n_logits, sigma, use_LN_in_critic,
+                 use_WD_in_enc, use_WD_in_critic, WD_rate, use_wandb):
         self.device = device
         self.use_wandb = use_wandb
         self.critic_target_tau = critic_target_tau
@@ -168,15 +182,19 @@ class DrQV2Agent:
                            hidden_dim).to(device)
 
         self.critic = Critic(self.encoder.repr_dim, action_shape, feature_dim,
-                             hidden_dim, n_logits).to(device)
+                             hidden_dim, n_logits, use_LN=use_LN_in_critic).to(device)
         self.critic_target = Critic(self.encoder.repr_dim, action_shape,
-                                    feature_dim, hidden_dim, n_logits).to(device)
+                                    feature_dim, hidden_dim, n_logits, use_LN=use_LN_in_critic).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         # optimizers
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        if use_WD_in_enc:
+            self.encoder_opt = torch.optim.AdamW(self.encoder.parameters(), lr=lr, weight_decay=WD_rate)
+        if use_WD_in_critic:
+            self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=lr, weight_decay=WD_rate)            
 
         # data augmentation
         self.aug = RandomShiftsAug(pad=4)

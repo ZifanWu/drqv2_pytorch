@@ -52,6 +52,10 @@ agent:
   max_value: 100
   n_logits: 100
   sigma: 0.75
+  use_LN_in_critic: true
+  use_WD_in_enc: true
+  use_WD_in_critic: true
+  WD_rate: 0.0001
   use_wandb: ${use_wandb}
 
 hydra:

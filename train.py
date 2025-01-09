@@ -226,7 +226,8 @@ def main(cfg):
         cfg.task_name, (cfg.agent.n_logits, cfg.agent.sigma) = setting_for_this_idx
         cfg.agent._target_ = 'drqv2.DrQV2Agent'
 
-    run_dir = "/scratch/general/nfs1/$USER/"
+    # run_dir = "/scratch/general/nfs1/$USER/"
+    run_dir = './results'
     if not Path(run_dir).exists():
         os.makedirs(str(run_dir))
     # -------------------------------------------------
