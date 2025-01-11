@@ -240,8 +240,9 @@ class DrQV2Agent:
         Q1_logits, Q2_logits = self.critic(obs, action)
         critic_loss = self.HLG.forward(Q1_logits, target_Q.squeeze()) + self.HLG.forward(Q2_logits, target_Q.squeeze())
 
+        Q1 = self.HLG.transform_from_probs(F.softmax(Q1_logits, dim=-1))
         if self.use_wandb:
-            # wandb.log({'q1': Q1.mean().item(), 'grad_step': step})
+            wandb.log({'q1': Q1.mean().item(), 'grad_step': step})
             # wandb.log({'q2': Q2.mean().item(), 'grad_step': step})
             wandb.log({'critic_loss': critic_loss.item(), 'grad_step': step})
 

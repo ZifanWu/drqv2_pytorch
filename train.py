@@ -103,12 +103,13 @@ class Workspace:
         return self._replay_iter
 
     def eval(self):
-        step, episode, total_reward = 0, 0, 0
+        step, episode, total_reward, oracle_q = 0, 0, 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
 
         while eval_until_episode(episode):
             time_step = self.eval_env.reset()
             self.video_recorder.init(self.eval_env, enabled=(episode == 0))
+            episode_step = 0
             while not time_step.last():
                 with torch.no_grad(), utils.eval_mode(self.agent):
                     action = self.agent.act(time_step.observation,
@@ -117,6 +118,8 @@ class Workspace:
                 time_step = self.eval_env.step(action)
                 self.video_recorder.record(self.eval_env)
                 total_reward += time_step.reward
+                oracle_q += time_step.reward * self.cfg.discount ** episode_step
+                episode_step += 1
                 step += 1
 
             episode += 1
@@ -124,11 +127,14 @@ class Workspace:
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
             log('episode_reward', total_reward / episode)
+            log('oracle_q', oracle_q / episode)
             log('episode_length', step * self.cfg.action_repeat / episode)
             log('episode', self.global_episode)
             log('step', self.global_step)
         if self.cfg.use_wandb:
             wandb.log({'eval_ret': total_reward / episode, 'env_step': self.global_step})
+            wandb.log({'oracle_q': oracle_q / episode, 'env_step': self.global_step})
+
 
     def train(self):
         # predicates
@@ -139,7 +145,7 @@ class Workspace:
         eval_every_step = utils.Every(self.cfg.eval_every_frames,
                                       self.cfg.action_repeat)
 
-        episode_step, episode_reward = 0, 0
+        episode_step, episode_reward, oracle_q = 0, 0, 0
         time_step = self.train_env.reset()
         self.replay_storage.add(time_step)
         self.train_video_recorder.init(time_step.observation)
@@ -158,10 +164,12 @@ class Workspace:
                         log('fps', episode_frame / elapsed_time)
                         log('total_time', total_time)
                         log('episode_reward', episode_reward)
+                        log('oracle_q', oracle_q)
                         log('episode_length', episode_frame)
                         log('episode', self.global_episode)
                         log('buffer_size', len(self.replay_storage))
                         log('step', self.global_step)
+                    print('Seed: ', self.seed)
 
                 # reset env
                 time_step = self.train_env.reset()
@@ -172,6 +180,7 @@ class Workspace:
                     self.save_snapshot()
                 episode_step = 0
                 episode_reward = 0
+                oracle_q = 0
 
             # try to evaluate
             if eval_every_step(self.global_step):
@@ -193,6 +202,7 @@ class Workspace:
             # take env step
             time_step = self.train_env.step(action)
             episode_reward += time_step.reward
+            oracle_q += time_step.reward ** episode_step
             self.replay_storage.add(time_step)
             self.train_video_recorder.record(time_step.observation)
             episode_step += 1
@@ -218,16 +228,19 @@ def main(cfg):
     # -------------------------------------------------
     if cfg.index > -1: # using sbatch
         settings = []
-        for i in ['quadruped_run', 'acrobot_swingup', 'hopper_hop', 'walker_run', 'quadruped_walk']:
-            for j in [(100, 0.75)]:
+        for i in ['quadruped_run', 'acrobot_swingup']:
+            for j in [(200, 0.75), (400, 0.75), (1000, 0.75)]:
                 settings.append([i, j])
         setting_for_this_idx = settings[int(cfg.index)]
         # cfg.task_name, cfg.agent._target_ = setting_for_this_idx
         cfg.task_name, (cfg.agent.n_logits, cfg.agent.sigma) = setting_for_this_idx
-        cfg.agent._target_ = 'drqv2.DrQV2Agent'
+        cfg.agent._target_ = 'drqv2_hlg.DrQV2Agent'
+        cfg.agent.max_value = cfg.agent.n_logits
+    # if cfg.task_name == 'quadruped_walk':
+    #     cfg.agent.n_logits, cfg.agent.sigma = 400, 0.75
 
-    # run_dir = "/scratch/general/nfs1/$USER/"
-    run_dir = './results'
+    run_dir = "/scratch/general/nfs1/$USER/"
+    # run_dir = './results'
     if not Path(run_dir).exists():
         os.makedirs(str(run_dir))
     # -------------------------------------------------
